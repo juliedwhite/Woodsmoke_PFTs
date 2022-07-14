@@ -1,7 +1,8 @@
 # Residential wood burning and pulmonary function in the Agricultural Lung Health Study
  This analysis was undertaken to assess if wood burning exposure was related to 
  pulmonary function, and a publication is in review now. The repository will be
- updated with a citation when available. In the meantime, here is the abstract: 
+ updated with a citation when available. In the meantime, the abstract is below, 
+ and you can scroll through the executed code at https://juliedwhite.github.io/Woodsmoke_PFTs/
  
  
 *Background*  

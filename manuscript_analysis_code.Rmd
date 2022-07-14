@@ -1,0 +1,1727 @@
+---
+title: "Code used in 'Residential wood burning and pulmonary function in the Agricultural Lung Health Study' manuscript"
+author: "Julie D. White"
+date: "`r format(Sys.time(), '%b %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Packages
+```{r}
+library(tidyverse)
+library(survey)
+library(Gmisc)
+library(gtsummary)
+theme_gtsummary_compact()
+library(flextable)
+```
+
+# Data
+Loading and manipulating the data to convert some to factors and create wood
+burning exposure variable.
+```{r}
+# Most of the phenotype data
+pheno <- haven::read_sas("../data/lhs26801_pahanalyticvars_21sep02.sas7bdat")
+
+# COPD information
+copd <- readr::read_csv("../data/LHS26801_COPDPlus_29Mar22.txt", 
+                        col_types = c('d', 'c', 'c', 'c', 'c', 'c', 'c', 'c'))
+
+pheno <- dplyr::left_join(x = pheno, y = copd, by = "LHID") %>%
+  mutate(across(.cols = c(gender, race_B, state, LH_smoke_status, FTSC_season_v2,
+                          LHSScreen_12142015, Im_Atopic_Spec_v2, XH38, P1_educ_v3,
+                          P3_COPDorEMPHYSEMA, FTSC_FeNOBIN), as.factor), 
+         # Create Wood burning exposure variable
+         WoodExp = factor(case_when(
+           # No exposure, as best we can judge
+           XH34 != 5 & # Main heating fuel not wood
+             XH36e == 0 & # Secondary heating fuel not wood
+             XH37 %in% c(NA_real_, 0) & # Wood stove use NA or never
+             XH40 %in% c(NA_real_, 0) ~ 0, # Fireplace use NA or never
+           # Lots of fireplace or wood stove exposure
+           XH39 %in% c(3, 4) ~ 2, # Wood stove use freq or most days/nights 
+           XH41 %in% c(3, 4) ~ 2, # Fireplace use freq or most days/nights
+           # Some fireplace or wood stove exposure
+           XH39 %in% c(1, 2) ~ 1, # Wood stove use rarely or occasionally
+           XH41 %in% c(1, 2) ~ 1, # Fireplace use rarely or occasionally
+           # Some exposure from primary or secondary heating
+           XH34 == 5 ~ 1, # Main heating fuel is wood
+           XH36e == 1 ~ 1, # Secondary heating fuel is wood
+           # Don't fit into any of the above 
+           TRUE ~ NA_real_)),
+         # Manual interaction between wood exposure and asthma status
+         WoodExpAsthmaInt = factor(case_when(
+           WoodExp == 0 & LHSScreen_12142015 == 0 ~ "Unexp-Noncase",
+           WoodExp == 1 & LHSScreen_12142015 == 0 ~ "Some-Noncase",
+           WoodExp == 2 & LHSScreen_12142015 == 0 ~ "Freq-Noncase",
+           WoodExp == 0 & LHSScreen_12142015 == 1 ~ "Unexp-Case",
+           WoodExp == 1 & LHSScreen_12142015 == 1 ~ "Some-Case",
+           WoodExp == 2 & LHSScreen_12142015 == 1 ~ "Freq-Case"),
+           levels = c("Unexp-Noncase", "Some-Noncase", "Freq-Noncase", "Unexp-Case",
+                      "Some-Case", "Freq-Case")),
+         # Manual interaction between wood exposure and smoking status
+         WoodExpSmokingInt = factor(case_when(
+           WoodExp == 0 & LH_smoke_status == 1 ~ "Unexp-Never",
+           WoodExp == 1 & LH_smoke_status == 1 ~ "Some-Never",
+           WoodExp == 2 & LH_smoke_status == 1 ~ "Freq-Never",
+           WoodExp == 0 & LH_smoke_status == 2 ~ "Unexp-Former",
+           WoodExp == 1 & LH_smoke_status == 2 ~ "Some-Former",
+           WoodExp == 2 & LH_smoke_status == 2 ~ "Freq-Former",
+           WoodExp == 0 & LH_smoke_status == 3 ~ "Unexp-Current",
+           WoodExp == 1 & LH_smoke_status == 3 ~ "Some-Current",
+           WoodExp == 2 & LH_smoke_status == 3 ~ "Freq-Current"),
+           levels = c("Unexp-Never", "Some-Never", "Freq-Never", "Unexp-Former", 
+                      "Some-Former", "Freq-Former", "Unexp-Current", "Some-Current",
+                      "Freq-Current")))
+
+table(pheno$WoodExp, useNA = "ifany")
+```
+
+Subset the data to remove individuals with missing or invalid PFT scores, 
+one of each household where farmer and spouse received their home visit at the 
+same address, and covariate or exposure data.
+```{r}
+# Subset to individuals with PFTs, and with valid QFVC scores
+pheno_analysis <- pheno %>% 
+  drop_na(FEV1_01) %>%
+  filter(QFVC_01 %in% c("A", "B", "C"))
+
+# Randomly select one member of each household where farmer and spouse received
+# their home visit at the same address
+set.seed(543)
+paired_household_random <- pheno_analysis %>%
+  group_by(partid) %>%  # Household indicator
+  filter(n() > 1) %>% # Two people from the same household
+  filter(sameaddr == "yes") %>% # Living at the same address
+  sample_n(1) %>% #Randomly choose one from each household
+  select(partid, LHID)
+
+# Subset our analysis data frame to remove these people
+pheno_analysis <- pheno_analysis %>%
+  filter(!LHID %in% paired_household_random$LHID) %>%
+  # Drop missing information in our analytic variables
+  drop_na(WoodExp, pft_age, pft_age_sq, gender, race_B, LH_Height, Height_2,
+          LH_Weight, state, LH_smoke_status, LH_packyears)
+
+table(pheno_analysis$WoodExp, useNA = "ifany")
+```
+
+Create survey design object based on asthma status proportions in our sample vs.
+the parent study.
+```{r}
+# Calculate weights based on selection probability
+p_asthma_overall = 3024/(41106+3024) # Proportion of cases in the AHS
+p_asthma_nested = # Proportion of cases in analytic sample
+  nrow(pheno_analysis[pheno_analysis$LHSScreen_12142015 == 1,])/nrow(pheno_analysis)
+p_nonasthma_overall = 41106/(41106+3024) # Proportion of noncases in the AHS
+p_nonasthma_nested = # Proportion of noncases in analytic sample
+  nrow(pheno_analysis[pheno_analysis$LHSScreen_12142015 == 0,])/nrow(pheno_analysis)
+
+# Assign the inverse probability of those weights based on case status
+pheno_analysis <- 
+  mutate(pheno_analysis,
+         lhsscreen_12142015_weight = case_when(
+           LHSScreen_12142015 == 0 ~ 1/(p_nonasthma_nested/p_nonasthma_overall),
+           LHSScreen_12142015 == 1 ~ 1/(p_asthma_nested/p_asthma_overall),
+           TRUE ~ NA_real_))
+
+table(pheno_analysis$lhsscreen_12142015_weight, useNA = "ifany")
+
+# Create survey design object
+pheno_analysis_surv <- svydesign(id = ~LHID, strata = ~LHSScreen_12142015,
+                                 weights = ~lhsscreen_12142015_weight,
+                                 data = pheno_analysis)
+```
+
+Create a separate dataframe for the FeNO analysis
+```{r}
+pheno_analysis_feno <- pheno_analysis %>%
+  # 5 ppb is the detection limit for the NIOX MINO, so setting values below that
+  # as LOD / sqrt2. FeNO is then log transformed because it is right skewed
+  mutate(FTSC_eNO_Average_Win = case_when(FTSC_eNO_Average < 5 ~ 5/sqrt(2),
+                                          TRUE ~ FTSC_eNO_Average),
+         FTSC_eNO_Average_Win_log = log(FTSC_eNO_Average_Win)) %>%
+  # Drop missing information in our additional analytic variables
+  drop_na(FTSC_eNO_Average_Win_log, Im_Atopic_Spec_v2)
+
+table(pheno_analysis_feno$WoodExp, useNA = "ifany")
+
+# Calculate selection probability weights on the feno analytic sample
+p_asthma_feno = 
+  nrow(pheno_analysis_feno[pheno_analysis_feno$LHSScreen_12142015 == 1,])/nrow(pheno_analysis_feno)
+p_nonasthma_feno = 
+  nrow(pheno_analysis_feno[pheno_analysis_feno$LHSScreen_12142015 == 0,])/nrow(pheno_analysis_feno)
+
+# Assign inverse probability weights
+pheno_analysis_feno <- pheno_analysis_feno %>%
+  mutate(lhsscreen_12142015_weight = 
+           case_when(LHSScreen_12142015 == 0 ~ 1/(p_nonasthma_feno/p_nonasthma_overall),
+                     LHSScreen_12142015 == 1 ~ 1/(p_asthma_feno/p_asthma_overall),
+                     TRUE ~ NA_real_))
+
+table(pheno_analysis_feno$lhsscreen_12142015_weight)
+
+# Create survey design object
+pheno_analysis_feno_surv <- svydesign(id = ~LHID, strata = ~LHSScreen_12142015,
+                                      weights = ~lhsscreen_12142015_weight,
+                                      data = pheno_analysis_feno)
+```
+
+Report the percentage of people with FeNO values below the limit of detection
+```{r}
+signif(length(which(pheno_analysis_feno$FTSC_eNO_Average < 5)) / 
+         length(which(!is.na(pheno_analysis_feno$FTSC_eNO_Average))) * 100, 
+       digits = 2)
+```
+
+
+Report the average lag time between the wood burning survey and home visit
+```{r}
+pheno_analysis %>% select(FTSC_DATE, CATICompleteDate) %>%
+  mutate(lag = as.numeric(CATICompleteDate - FTSC_DATE)) %>%
+  summarize(median = median(lag), first_quartile = quantile(lag, 0.25), 
+            third_quartile = quantile(lag, 0.75))
+```
+
+# SI Figure 1: Sample size flow chart
+Calculate numbers for each exclusion criteria
+```{r}
+# Number of total ALHS individuals
+a_num <- nrow(pheno)
+# Number of individuals with complete PFTs
+b1_num <- nrow(pheno %>% drop_na(FEV1_01, FVC_01, RATIO1_01_r))
+
+# Number of individuals with incomplete PFTs
+b2_num <- nrow(pheno %>% 
+                 dplyr::select(FEV1_01, FVC_01, RATIO1_01_r) %>%
+                 filter_all(any_vars(is.na(.)))) 
+# Number of individuals with FVC score of at least C
+c1_num <- nrow(pheno %>% 
+                 drop_na(FEV1_01, FVC_01, RATIO1_01_r) %>% 
+                 filter(QFVC_01 %in% c("A", "B", "C")))
+# Number of individuals with FVC score of D or F
+c2_num <- nrow(pheno %>% 
+                 drop_na(FEV1_01, FVC_01, RATIO1_01_r) %>% 
+                 filter(QFVC_01 %in% c("D", "F")))
+# Number of individuals after removing one of each household
+d1_num <- nrow(pheno %>% 
+                 drop_na(FEV1_01, FVC_01, RATIO1_01_r) %>%
+                 filter(QFVC_01 %in% c("A", "B", "C")) %>%
+                 filter(!LHID %in% paired_household_random$LHID))
+# Number of individuals removed from paired households
+d2_num <- c1_num - d1_num
+# Number of individuals after removing missing covariates & WoodExp
+e1_num <- nrow(pheno %>% 
+                drop_na(FEV1_01, FVC_01, RATIO1_01_r) %>%
+                filter(QFVC_01 %in% c("A", "B", "C")) %>%
+                filter(!LHID %in% paired_household_random$LHID) %>%
+                drop_na(WoodExp, pft_age, pft_age_sq, gender, race_B, LH_Height, 
+                        Height_2, LH_Weight, state, LH_smoke_status, 
+                        LH_packyears))
+# Number of individuals unable to categorize
+e2_num <- nrow(pheno %>% 
+                drop_na(FEV1_01, FVC_01, RATIO1_01_r) %>%
+                filter(QFVC_01 %in% c("A", "B", "C")) %>%
+                filter(!LHID %in% paired_household_random$LHID) %>%
+                drop_na(pft_age, pft_age_sq, gender, race_B, LH_Height, 
+                        Height_2, LH_Weight, state, LH_smoke_status, 
+                        LH_packyears) %>%
+                 filter(is.na(WoodExp)))
+# Number of individuals missing covariates
+e3_num <- d1_num - e1_num - e2_num
+
+# Unexposed
+f_num = nrow(pheno_analysis %>% filter(WoodExp == 0))
+# Mildly exposed
+g_num = nrow(pheno_analysis %>% filter(WoodExp == 1))
+# Moderate to Frequent exposure
+h_num = nrow(pheno_analysis %>% filter(WoodExp == 2))
+```     
+
+Create and save image
+```{r}
+#get file ready to receive image
+#jpeg("../Manuscript/FigS1_FlowDiagram.jpg", width=12, height = 8, 
+#    units = "in", res = 300)
+
+grid.newpage()
+
+midx = 0.5
+leftx = 0.25
+rightx = 0.8
+
+# A to B1
+(a <- boxGrob(paste("Agricultural Lung Health Study", 
+                    paste("n =", a_num), 
+                    sep = '\n'), x = midx, y = 0.95))
+
+(b1 <- boxGrob(paste("Individuals with complete spirometry", 
+                    paste("n =", b1_num), sep = '\n'), x = midx, y = 0.8))
+connectGrob(a, b1, "vertical")
+
+# B1 to B2
+(b2 <- boxGrob(paste("Remove individuals with",
+                     paste0("incomplete spirometry (n = ", b2_num, ")"),
+                     sep = '\n'), x = rightx, y = 0.875))
+connectGrob(b1, b2, "-")
+
+# B1 to to C1
+(c1 <- boxGrob(paste("Individuals with valid spirometry measurements", 
+                     paste("n = ", c1_num), sep = '\n'), 
+               x = midx, y = 0.65))
+connectGrob(b1, c1, "vertical")
+
+# C1 to C2
+(c2 <- boxGrob(paste("Remove individuals with invalid ",
+                     paste0("spirometry measurements (n = ", c2_num, ")"),
+                     sep = '\n'),
+               x = rightx, y = 0.725))
+connectGrob(c1, c2, "-")
+
+# C1 to D1
+(d1 <- boxGrob(paste("Individuals after removing", 
+                     "one from each shared household", 
+                      paste("n =", d1_num), sep = '\n'), x = midx, y = 0.475))
+connectGrob(c1, d1, "vertical")
+
+# D1 to D2
+(d2 <- boxGrob(paste("One individual removed from", 
+                     paste0("each shared household (n = ", d2_num, ")"),
+                     sep = '\n'), x = rightx, y=0.575))
+connectGrob(d1, d2, "-")
+
+# D1 to E1
+(e1 <- boxGrob(paste("Individuals with complete information", 
+                      paste("n =", e1_num), sep = '\n'), x = midx, y = 0.3))
+connectGrob(d1, e1, "vertical")
+
+# E1 to E2,3
+(e2 <- boxGrob(paste("Remove individuals with:",
+                    paste0("Missing covariate information (n = ", e3_num, ")"),
+                    paste0("Uncategorized wood burning exposure (n = ", e2_num, ")"),
+                    sep = '\n'), 
+              x = rightx, y = 0.375))
+connectGrob(e1, e2, "-")
+
+(ghost <- boxGrob(label = "", x = midx, y = 0.25, width = 0, height = 0))
+connectGrob(e1, ghost, "vertical", arrow_obj = arrow(unit(0, "in")))
+
+# D1 to F
+(f <- boxGrob(paste("Unexposed", paste("n =", f_num), sep = '\n'), x = 0.35, 
+                 y = 0.1))
+connectGrob(ghost, f, "N")
+
+# D1 to G
+(g <- boxGrob(paste("Some exposure", paste("n =", g_num), sep = '\n'),
+              x = midx, y = 0.1))
+connectGrob(ghost, g, "N")
+
+# D1 to H
+(h <- boxGrob(paste("Frequent exposure", paste("n =", h_num), 
+                    sep = '\n'), x = 0.7, y = 0.1))
+connectGrob(ghost, h, "N")
+
+# Print grobs
+a
+b1
+b2
+c1
+c2
+d1
+d2
+e1
+e2
+ghost
+f
+g
+h
+
+# save and close file
+#dev.off()
+
+#clean up
+rm(a, b1, b2, c1, c2, d1, d2, e1, e2, ghost, f, g, h, a_num, b1_num, b2_num,
+   c1_num, c2_num, d1_num, d2_num, e1_num, e2_num, e3_num, f_num, g_num, 
+   h_num, leftx, midx, rightx)
+
+```
+
+# Table 1: Study population characteristics
+```{r}
+# Variables to go in the table, in order
+vars <- c("WoodExp", "gender", "pft_age", "LH_Height", "LH_Weight", "race_B",
+          "P1_educ_v3", "state", "LH_smoke_status", "LH_packyears", 
+          "LHSScreen_12142015", "Im_Atopic_Spec_v2", "P3_COPDorEMPHYSEMA",
+          "FTSC_season_v2")
+
+# Creating a special dataframe just for the table so we can re-code the variables
+# to be human readable.
+tbl_df <- pheno_analysis %>%
+  dplyr::select(all_of(vars)) %>%
+  mutate(
+    WoodExp = recode(WoodExp, `0` = "Unexposed", `1` = "Some exposure", 
+                     `2` = "Frequent exposure"),
+    gender = recode(gender, `0` = "Female", `1` = "Male"),
+    state = recode(state, `0` = "Iowa", `1` = "North Carolina"),
+    race_B = recode(race_B, `0` = "White", `1` = "Non-white"),
+    P1_educ_v3 = recode(P1_educ_v3, `1` = "Up to high school grad", 
+                        `2` = "More than high school", 
+                        `3` = "College grad and above"),
+    # This next line makes it so that packyears are only calculated for ever 
+    # smokers, but it introduces NA values so the "Missing" line under packyears
+    # was removed from publication tables.
+    LH_packyears = case_when(LH_smoke_status == 1 ~ NA_real_, 
+                             LH_smoke_status %in% c(2,3) ~ LH_packyears),
+    LH_smoke_status = recode(LH_smoke_status, `1` = "Never", `2` = "Former", 
+                             `3` = "Current"),
+    LHSScreen_12142015 = recode(LHSScreen_12142015, `0` = "Non-case", 
+                                `1` = "Case"),
+    Im_Atopic_Spec_v2 = recode(Im_Atopic_Spec_v2, `0` = "Non-case", `1` = "Case"),
+    P3_COPDorEMPHYSEMA = recode(P3_COPDorEMPHYSEMA, "0) No" = "Non-case", 
+                                "1) Yes" = "Case"),
+    FTSC_season_v2 = recode(FTSC_season_v2, 
+                            `0` = "Spring (March 21 – June 20)",
+                            `1` = "Summer (June 21 – Sept. 20)", 
+                            `2` = "Fall (Sept. 21 – Dec. 21)",
+                            `3` = "Winter (Dec. 22 – March 20)"))
+
+table1_overall <- tbl_summary(
+  tbl_df %>% select(-WoodExp) %>% 
+    mutate(across(.cols = c(P1_educ_v3, Im_Atopic_Spec_v2, P3_COPDorEMPHYSEMA),
+                  forcats::fct_explicit_na)),
+           missing = "ifany",
+           statistic = list(all_continuous() ~ "{mean} ({sd})",
+                            all_categorical() ~ "{n} ({p}%)"),
+           percent = "col",
+           missing_text = "(Missing)",
+           label = list(pft_age ~ "Age",
+                        gender ~ "Gender",
+                        LH_Height ~ "Height (cm)",
+                        LH_Weight ~ "Weight (kg)", 
+                        race_B ~ "Race", state ~ "State",
+                        P1_educ_v3 ~ "Education",
+                        LH_smoke_status ~ "Smoking status",
+                        LH_packyears ~ "Packyears among ever smokers",
+                        LHSScreen_12142015 ~ "Asthma status",
+                        Im_Atopic_Spec_v2 ~ "Atopy status",
+                        P3_COPDorEMPHYSEMA ~ "COPD and/or emphysema status",
+                        FTSC_season_v2 ~ "Season")) %>%
+    bold_labels() %>%
+    italicize_levels()
+  
+table1 <- tbl_summary(tbl_df, by = WoodExp, missing = "ifany",
+              statistic = list(all_continuous() ~ "{mean} ({sd})",
+                               all_categorical() ~ "{n} ({p}%)"),
+              percent = "row",
+              missing_text = "(Missing)",
+              label = list(pft_age ~ "Age",
+                           gender ~ "Gender",
+                           LH_Height ~ "Height (cm)",
+                           LH_Weight ~ "Weight (kg)", 
+                           race_B ~ "Race", state ~ "State",
+                           P1_educ_v3 ~ "Education",
+                           LH_smoke_status ~ "Smoking status",
+                           LH_packyears ~ "Packyears among ever smokers",
+                           LHSScreen_12142015 ~ "Asthma status",
+                           Im_Atopic_Spec_v2 ~ "Atopy status",
+                           P3_COPDorEMPHYSEMA ~ "COPD and/or emphysema status",
+                           FTSC_season_v2 ~ "Season")) %>%
+  modify_header(label ~ "**Characteristic**") %>%
+  bold_labels() %>%
+  italicize_levels() %>%
+  add_p(pvalue_fun = ~style_pvalue(.x, digits = 2))
+
+tbl_merge(list(table1_overall, table1), 
+          tab_spanner = c("Total", "Wood burning exposure")) # %>%
+  # as_flex_table() %>% print(preview = "docx")
+
+# Clean up
+rm(vars, tbl_df, table1, table1_overall)
+```
+
+# Table 2 - Survey weighted multivariable results in all subjects
+```{r}
+# Get association statistics
+# FEV1
+covars <- c("pft_age", "pft_age_sq", "gender", "race_B", "LH_Height", "Height_2", 
+            "state", "LH_smoke_status", "LH_packyears")
+
+multivar_results <- summary(svyglm(formula = 
+                                     paste0("FEV1_01 ~ WoodExp + ", 
+                                            paste(covars, collapse = " + ")),
+                                   design = pheno_analysis_surv))$coef %>% 
+  as.data.frame() %>%
+  rownames_to_column("Covariate") %>%
+  filter(grepl("WoodExp", Covariate)) %>% 
+  mutate(PFT = "FEV1")
+
+# FVC
+fvc_covars <- c("pft_age", "pft_age_sq", "gender", "race_B", "LH_Height", 
+                "Height_2", "LH_Weight", "state", "LH_smoke_status", 
+                "LH_packyears")
+
+multivar_results <- 
+  rbind(multivar_results, 
+        summary(svyglm(formula = paste0("FVC_01 ~ WoodExp + ", 
+                                        paste(fvc_covars, collapse = " + ")),
+                       design = pheno_analysis_surv))$coef %>% 
+          as.data.frame() %>%
+          rownames_to_column("Covariate") %>%
+          filter(grepl("WoodExp", Covariate)) %>% 
+          mutate(PFT = "FVC"))
+
+# Ratio
+multivar_results <- 
+  rbind(multivar_results, 
+        summary(svyglm(formula = 
+                         paste0("RATIO1_01_r ~ WoodExp + ", 
+                                paste(covars, collapse = " + ")),
+                       design = pheno_analysis_surv))$coef %>% 
+          as.data.frame() %>%
+          rownames_to_column("Covariate") %>%
+          filter(grepl("WoodExp", Covariate)) %>% 
+          mutate(PFT = "Ratio"))
+
+# Write the association statistics part of table 2
+multivar_results %>%
+  mutate(Covariate = str_replace_all(Covariate, c("WoodExp1" = "Some",
+                                                  "WoodExp2" = "Frequent")),
+         LowCI = Estimate - (1.96 * `Std. Error`),
+         HighCI = Estimate + (1.96 * `Std. Error`)) %>%
+  mutate(Estimate = case_when(PFT %in% c("FEV1", "FVC") ~ round(Estimate, digits = 0),
+                                 PFT == "Ratio" ~ signif(Estimate, digits = 1)),
+         LowCI = case_when(PFT %in% c("FEV1", "FVC") ~ round(LowCI, digits = 0),
+                              PFT == "Ratio" ~ signif(LowCI, digits = 1)),
+         HighCI = case_when(PFT %in% c("FEV1", "FVC") ~ round(HighCI, digits = 0),
+                               PFT == "Ratio" ~ signif(HighCI, digits = 1))) %>%
+  rename(P = `Pr(>|t|)`) %>%
+  dplyr::select(PFT, Covariate, Estimate, LowCI, HighCI) %>%
+  mutate(LowCI = paste0("(", LowCI),
+         HighCI = paste0(HighCI, ")")) %>%
+  unite(col = CI, c(LowCI, HighCI), sep = ", ", remove = TRUE) %>%
+  unite(col = Estimate, c(Estimate, CI), sep = "\n", remove = TRUE) %>%
+  pivot_wider(names_from = PFT, values_from = Estimate) %>%
+  dplyr::select(Covariate, starts_with("FEV1"), starts_with("FVC"), 
+                starts_with("Ratio")) %>%
+  flextable() %>%
+  theme_box() %>% 
+  autofit() %>%
+  align(align = "center", part = "all") #%>% print(preview = "docx")
+```
+
+Weighted average and SD for PFTs across groups. Tje N's listed in the header are
+weighted Ns (default of the function). In the manuscript we report unweighted Ns.
+```{r}
+tbl_svysummary(by = WoodExp, missing = "ifany",
+               statistic = list(all_continuous() ~ "{mean} ({sd})"),
+               label = list(FEV1_01 ~ "FEV1",
+                            FVC_01 ~ "FVC",
+                            RATIO1_01_r ~ "FEV1/FVC"),
+               data = pheno_analysis_surv,
+               include = c("FEV1_01", "FVC_01","RATIO1_01_r", "WoodExp"))
+```
+Unweighted Ns by group
+```{r}
+table(pheno_analysis_surv$variables$WoodExp, useNA = "ifany")
+```
+
+# Table S2: Unweighted multivariable results in all subjects
+```{r}
+# Association statistics
+# FEV1
+multivar_results <- 
+  summary(lm(formula = paste0("FEV1_01 ~ WoodExp + ", 
+                              paste(covars, collapse = " + ")), 
+             data = pheno_analysis))$coef %>% 
+  as.data.frame() %>%
+  rownames_to_column("Covariate") %>%
+  filter(grepl("WoodExp", Covariate)) %>% 
+  mutate(PFT = "FEV1")
+
+# FVC
+multivar_results <- 
+  rbind(multivar_results, 
+        summary(lm(formula = paste0("FVC_01 ~ WoodExp + ", 
+                                    paste(fvc_covars, collapse = " + ")),
+                   data = pheno_analysis))$coef %>% 
+          as.data.frame() %>%
+          rownames_to_column("Covariate") %>%
+          filter(grepl("WoodExp", Covariate)) %>% 
+          mutate(PFT = "FVC"))
+
+# Ratio
+multivar_results <- 
+  rbind(multivar_results, 
+        summary(lm(formula = paste0("RATIO1_01_r ~ WoodExp + ", 
+                                    paste(covars, collapse = " + ")),
+                   data = pheno_analysis))$coef %>% 
+          as.data.frame() %>%
+          rownames_to_column("Covariate") %>%
+          filter(grepl("WoodExp", Covariate)) %>% 
+          mutate(PFT = "Ratio"))
+
+# Write association stats part of Table S2
+multivar_results %>%
+  mutate(Covariate = str_replace_all(Covariate, c("WoodExp1" = "Some",
+                                                  "WoodExp2" = "Frequent")),
+         LowCI = Estimate - (1.96 * `Std. Error`),
+         HighCI = Estimate + (1.96 * `Std. Error`)) %>%
+  mutate(Estimate = case_when(PFT %in% c("FEV1", "FVC") ~ round(Estimate, digits = 0),
+                                 PFT == "Ratio" ~ signif(Estimate, digits = 1)),
+         LowCI = case_when(PFT %in% c("FEV1", "FVC") ~ round(LowCI, digits = 0),
+                              PFT == "Ratio" ~ signif(LowCI, digits = 1)),
+         HighCI = case_when(PFT %in% c("FEV1", "FVC") ~ round(HighCI, digits = 0),
+                               PFT == "Ratio" ~ signif(HighCI, digits = 1))) %>%
+  rename(P = `Pr(>|t|)`) %>%
+  dplyr::select(PFT, Covariate, Estimate, LowCI, HighCI) %>%
+  mutate(LowCI = paste0("(", LowCI),
+         HighCI = paste0(HighCI, ")")) %>%
+  unite(col = CI, c(LowCI, HighCI), sep = ", ", remove = TRUE) %>%
+  unite(col = Estimate, c(Estimate, CI), sep = "\n", remove = TRUE) %>%
+  pivot_wider(names_from = PFT, values_from = Estimate) %>%
+  dplyr::select(Covariate, starts_with("FEV1"), starts_with("FVC"), 
+                starts_with("Ratio")) %>%
+  flextable() %>%
+  theme_box() %>% 
+  autofit() %>%
+  align(align = "center", part = "all") #%>% print(preview = "docx")
+```
+
+Unweighted average and SD for PFTs across groups:
+```{r}
+tbl_summary(by = WoodExp, missing = "ifany",
+               statistic = list(all_continuous() ~ "{mean} ({sd})"),
+               label = list(FEV1_01 ~ "FEV1",
+                            FVC_01 ~ "FVC",
+                            RATIO1_01_r ~ "FEV1/FVC"),
+               data = pheno_analysis,
+               include = c("FEV1_01", "FVC_01","RATIO1_01_r", "WoodExp"))
+```
+
+# Table S3: Sample weighted multivariable association results for individuals sampled in the cold season
+```{r}
+# Subset our survey design object to people visited in the cold season
+tmp <- subset(pheno_analysis_surv, lubridate::month(FTSC_DATE) %in% c(1,2,3,4,11,12))
+
+# Association statistics
+# FEV1
+multivar_results <- summary(svyglm(formula = 
+                                     paste0("FEV1_01 ~ WoodExp + ", 
+                                            paste(covars, collapse = " + ")),
+                                   design = tmp))$coef %>% 
+  as.data.frame() %>%
+  rownames_to_column("Covariate") %>%
+  filter(grepl("WoodExp", Covariate)) %>% 
+  mutate(PFT = "FEV1")
+
+# FVC
+multivar_results <- 
+  rbind(multivar_results, 
+        summary(svyglm(formula = paste0("FVC_01 ~ WoodExp + ", 
+                                        paste(fvc_covars, collapse = " + ")),
+                       design = tmp))$coef %>% 
+          as.data.frame() %>%
+          rownames_to_column("Covariate") %>%
+          filter(grepl("WoodExp", Covariate)) %>% 
+          mutate(PFT = "FVC"))
+
+# Ratio
+multivar_results <- rbind(multivar_results, summary(svyglm(formula = 
+                                     paste0("RATIO1_01_r ~ WoodExp + ", 
+                                            paste(covars, collapse = " + ")),
+                                   design = tmp))$coef %>% 
+  as.data.frame() %>%
+  rownames_to_column("Covariate") %>%
+  filter(grepl("WoodExp", Covariate)) %>% 
+  mutate(PFT = "Ratio"))
+
+# Write table
+multivar_results %>%
+  mutate(Covariate = str_replace_all(Covariate, c("WoodExp1" = "Some",
+                                                  "WoodExp2" = "Frequent")),
+         LowCI = Estimate - (1.96 * `Std. Error`),
+         HighCI = Estimate + (1.96 * `Std. Error`)) %>%
+  mutate(Estimate = case_when(PFT %in% c("FEV1", "FVC") ~ round(Estimate, digits = 0),
+                                 PFT == "Ratio" ~ signif(Estimate, digits = 1)),
+         LowCI = case_when(PFT %in% c("FEV1", "FVC") ~ round(LowCI, digits = 0),
+                              PFT == "Ratio" ~ signif(LowCI, digits = 1)),
+         HighCI = case_when(PFT %in% c("FEV1", "FVC") ~ round(HighCI, digits = 0),
+                               PFT == "Ratio" ~ signif(HighCI, digits = 1))) %>%
+  rename(P = `Pr(>|t|)`) %>%
+  dplyr::select(PFT, Covariate, Estimate, LowCI, HighCI) %>%
+  mutate(LowCI = paste0("(", LowCI),
+         HighCI = paste0(HighCI, ")")) %>%
+  unite(col = CI, c(LowCI, HighCI), sep = ", ", remove = TRUE) %>%
+  unite(col = Estimate, c(Estimate, CI), sep = "\n", remove = TRUE) %>%
+  pivot_wider(names_from = PFT, values_from = Estimate) %>%
+  dplyr::select(Covariate, starts_with("FEV1"), starts_with("FVC"), 
+                starts_with("Ratio")) %>%
+  flextable() %>%
+  theme_box() %>% 
+  autofit() %>%
+  align(align = "center", part = "all") #%>% print(preview = "docx")
+
+```
+
+Weighted average and SD for PFTs across groups. Tje N's listed in the header are
+weighted Ns (default of the function). In the manuscript we report unweighted Ns.
+```{r}
+tbl_svysummary(by = WoodExp, missing = "ifany",
+               statistic = list(all_continuous() ~ "{mean} ({sd})"),
+               label = list(FEV1_01 ~ "FEV1",
+                            FVC_01 ~ "FVC",
+                            RATIO1_01_r ~ "FEV1/FVC"),
+               data = tmp,
+               include = c("FEV1_01", "FVC_01","RATIO1_01_r", "WoodExp"))
+```
+
+Unweighted Ns:
+```{r}
+table(tmp$variables$WoodExp, useNA = "ifany")
+```
+
+# Table S4: Weighted multivariable association results for individuals identified as "White" 
+```{r}
+# Subset the survey design object
+tmp <- subset(pheno_analysis_surv, race_B == 0)
+
+# Association statstics
+# FEV1
+multivar_results <- summary(svyglm(formula = 
+                                     paste0("FEV1_01 ~ WoodExp + ", 
+                                            paste(covars[-which(covars == "race_B")], 
+                                                  collapse = " + ")),
+                                   design = tmp))$coef %>% 
+  as.data.frame() %>%
+  rownames_to_column("Covariate") %>%
+  filter(grepl("WoodExp", Covariate)) %>% 
+  mutate(PFT = "FEV1")
+
+# FVC
+multivar_results <- 
+  rbind(multivar_results, 
+        summary(svyglm(formula = paste0("FVC_01 ~ WoodExp + ", 
+                                        paste(fvc_covars[-which(fvc_covars == "race_B")], 
+                                              collapse = " + ")),
+                       design = tmp))$coef %>% 
+          as.data.frame() %>%
+          rownames_to_column("Covariate") %>%
+          filter(grepl("WoodExp", Covariate)) %>% 
+          mutate(PFT = "FVC"))
+
+# Ratio
+multivar_results <- 
+  rbind(multivar_results, summary(svyglm(formula = 
+                                           paste0("RATIO1_01_r ~ WoodExp + ", 
+                                                  paste(covars[-which(covars == "race_B")], 
+                                                        collapse = " + ")),
+                                         design = tmp))$coef %>% 
+          as.data.frame() %>%
+          rownames_to_column("Covariate") %>%
+          filter(grepl("WoodExp", Covariate)) %>% 
+          mutate(PFT = "Ratio"))
+
+# Write table: 
+multivar_results %>%
+  mutate(Covariate = str_replace_all(Covariate, c("WoodExp1" = "Some",
+                                                  "WoodExp2" = "Frequent")),
+         LowCI = Estimate - (1.96 * `Std. Error`),
+         HighCI = Estimate + (1.96 * `Std. Error`)) %>%
+  mutate(Estimate = case_when(PFT %in% c("FEV1", "FVC") ~ round(Estimate, digits = 0),
+                                 PFT == "Ratio" ~ signif(Estimate, digits = 1)),
+         LowCI = case_when(PFT %in% c("FEV1", "FVC") ~ round(LowCI, digits = 0),
+                              PFT == "Ratio" ~ signif(LowCI, digits = 1)),
+         HighCI = case_when(PFT %in% c("FEV1", "FVC") ~ round(HighCI, digits = 0),
+                               PFT == "Ratio" ~ signif(HighCI, digits = 1))) %>%
+  rename(P = `Pr(>|t|)`) %>%
+  dplyr::select(PFT, Covariate, Estimate, LowCI, HighCI) %>%
+  mutate(LowCI = paste0("(", LowCI),
+         HighCI = paste0(HighCI, ")")) %>%
+  unite(col = CI, c(LowCI, HighCI), sep = ", ", remove = TRUE) %>%
+  unite(col = Estimate, c(Estimate, CI), sep = "\n", remove = TRUE) %>%
+  pivot_wider(names_from = PFT, values_from = Estimate) %>%
+  dplyr::select(Covariate, starts_with("FEV1"), starts_with("FVC"), 
+                starts_with("Ratio")) %>%
+  flextable() %>%
+  theme_box() %>% 
+  autofit() %>%
+  align(align = "center", part = "all") #%>% print(preview = "docx")
+```
+
+Weighted average and SD for PFTs across groups. Tje N's listed in the header are
+weighted Ns (default of the function). In the manuscript we report unweighted Ns.
+```{r}
+tbl_svysummary(by = WoodExp, missing = "ifany",
+               statistic = list(all_continuous() ~ "{mean} ({sd})"),
+               label = list(FEV1_01 ~ "FEV1",
+                            FVC_01 ~ "FVC",
+                            RATIO1_01_r ~ "FEV1/FVC"),
+               data = tmp,
+               include = c("FEV1_01", "FVC_01","RATIO1_01_r", "WoodExp"))
+```
+
+Unweighted Ns:
+```{r}
+table(tmp$variables$WoodExp, useNA = "ifany")
+```
+
+# Table S5: Sample weighted multivariable association by smoking status
+```{r}
+# Analysis results
+contrast_list <- list("Some-Former" = c("WoodExpSmokingIntUnexp-Former"=-1,
+                                        "WoodExpSmokingIntSome-Former"=1),
+                      "Freq-Former" = c("WoodExpSmokingIntUnexp-Former"=-1,
+                                        "WoodExpSmokingIntFreq-Former"=1),
+                      "Some-Current" = c("WoodExpSmokingIntUnexp-Current"=-1,
+                                         "WoodExpSmokingIntSome-Current"=1),
+                      "Freq-Current" = c("WoodExpSmokingIntUnexp-Current"=-1,
+                                         "WoodExpSmokingIntFreq-Current"=1))
+
+# FEV1 
+fev1_mod <- svyglm(formula = paste0("FEV1_01 ~ ", 
+                                    paste(covars[-which(covars == "LH_smoke_status")], 
+                                          collapse = " + "), "+ WoodExpSmokingInt"), 
+                   design = pheno_analysis_surv)
+
+fev1_results <- 
+  rbind(summary(fev1_mod)$coef %>%
+          as.data.frame() %>%
+          rownames_to_column("Covariate") %>%
+          filter(grepl("Never", Covariate)) %>% 
+          mutate(Covariate = str_replace(Covariate, "WoodExpSmokingInt", "")) %>%
+          rename(SE = `Std. Error`, T = `t value`, P = `Pr(>|t|)`),
+        as_tibble(svycontrast(fev1_mod, contrasts = contrast_list), 
+                  rownames = NA) %>%
+          rownames_to_column("Covariate") %>%
+          rename(Estimate = contrast) %>%
+          mutate(T = Estimate/SE,
+                 P = 2 * pt(abs(T), df = df.residual(fev1_mod), lower.tail = FALSE))) %>%
+  mutate(PFT = "FEV1")
+
+# FVC
+fvc_mod <- svyglm(formula = paste0("FVC_01 ~ ", 
+                                   paste(fvc_covars[-which(fvc_covars == "LH_smoke_status")], 
+                                         collapse = " + "), "+ WoodExpSmokingInt"), 
+                   design = pheno_analysis_surv)
+
+fvc_results <- 
+  rbind(summary(fvc_mod)$coef %>%
+          as.data.frame() %>%
+          rownames_to_column("Covariate") %>%
+          filter(grepl("Never", Covariate)) %>% 
+          mutate(Covariate = str_replace(Covariate, "WoodExpSmokingInt", "")) %>%
+          rename(SE = `Std. Error`, T = `t value`, P = `Pr(>|t|)`),
+        as_tibble(svycontrast(fvc_mod, contrasts = contrast_list),
+                  rownames = NA) %>%
+          rownames_to_column("Covariate") %>%
+          rename(Estimate = contrast) %>%
+          mutate(T = Estimate/SE,
+                 P = 2 * pt(abs(T), df = df.residual(fvc_mod), lower.tail = FALSE))) %>%
+  mutate(PFT = "FVC")
+
+# Ratio
+ratio_mod <- svyglm(formula = paste0("RATIO1_01_r ~ ", 
+                                     paste(covars[-which(covars == "LH_smoke_status")], 
+                                           collapse = " + "), "+ WoodExpSmokingInt"), 
+                   design = pheno_analysis_surv)
+
+ratio_results <- 
+  rbind(summary(ratio_mod)$coef %>%
+          as.data.frame() %>%
+          rownames_to_column("Covariate") %>%
+          filter(grepl("Never", Covariate)) %>% 
+          mutate(Covariate = str_replace(Covariate, "WoodExpSmokingInt", "")) %>%
+          rename(SE = `Std. Error`, T = `t value`, P = `Pr(>|t|)`),
+        as_tibble(svycontrast(ratio_mod, contrasts = contrast_list),
+                  rownames = NA) %>%
+          rownames_to_column("Covariate") %>%
+          rename(Estimate = contrast) %>%
+          mutate(T = Estimate/SE,
+                 P = 2 * pt(abs(T), df = df.residual(ratio_mod), lower.tail = FALSE))) %>%
+  mutate(PFT = "Ratio")
+
+# Make table: 
+multivar_results <- rbind(fev1_results, fvc_results, ratio_results)
+
+multivar_results %>%
+  separate(col = Covariate, into = c("WoodExp", "Smoking"), sep = "-") %>%
+  mutate(LowCI = Estimate - (1.96 * SE),
+         HighCI = Estimate + (1.96 * SE),
+         Estimate = case_when(PFT %in% c("FEV1", "FVC") ~ round(Estimate, digits = 0),
+                                 PFT == "Ratio" ~ signif(Estimate, digits = 1)),
+         LowCI = case_when(PFT %in% c("FEV1", "FVC") ~ round(LowCI, digits = 0),
+                              PFT == "Ratio" ~ signif(LowCI, digits = 1)),
+         HighCI = case_when(PFT %in% c("FEV1", "FVC") ~ round(HighCI, digits = 0),
+                               PFT == "Ratio" ~ signif(HighCI, digits = 1))) %>%
+  dplyr::select(PFT, WoodExp, Smoking, Estimate, LowCI, HighCI) %>%
+  mutate(LowCI = paste0("(", LowCI),
+         HighCI = paste0(HighCI, ")")) %>%
+  unite(col = CI, c(LowCI, HighCI), sep = ", ", remove = TRUE) %>%
+  unite(col = Estimate, c(Estimate, CI), sep = "\n", remove = TRUE) %>%
+  pivot_wider(names_from = PFT, values_from = Estimate) %>%
+  dplyr::select(WoodExp, Smoking, starts_with("FEV1"), starts_with("FVC"), 
+                starts_with("Ratio")) %>%
+  flextable() %>%
+  theme_box() %>% 
+  autofit() %>%
+  align(align = "center", part = "all") #%>% print(preview = "docx")
+```
+
+Sample sizes by wood burning exposure and smoking status
+```{r}
+fev1_mod$model %>% group_by(WoodExpSmokingInt) %>% summarize(N = n())
+```
+
+
+# Figure S2: Predicted values by wood burning and smoking status
+```{r}
+# Data frame that will be used to store the predicted values
+pred_df_smoking <- tibble(
+  pft_age = svymean(~pft_age, design = pheno_analysis_surv)[1],
+  pft_age_sq = svymean(~pft_age, design = pheno_analysis_surv)[1]^2,
+  gender = factor(0),
+  race_B = factor(0),
+  LH_Height = svymean(~LH_Height, design = pheno_analysis_surv)[1],
+  Height_2 = svymean(~LH_Height, design = pheno_analysis_surv)[1]^2,
+  LH_Weight = svymean(~LH_Weight, design = pheno_analysis_surv)[1],
+  state = factor(0),
+  LH_packyears = svymean(~LH_packyears, design = pheno_analysis_surv)[1],
+  LH_smoke_status = factor(c(1,1,1,2,2,2,3,3,3)),
+  WoodExp = factor(c(0,1,2,0,1,2,0,1,2))
+)
+
+# FEV1
+# Association results, this time with the interaction modeled using *
+fev1_mod <- svyglm(formula = paste0("FEV1_01 ~ WoodExp + ", 
+                                    paste(covars, collapse = " + "),
+                                    " + WoodExp*LH_smoke_status"),
+                   design = pheno_analysis_surv)
+
+# Predict and add to prediction df
+pred_df_smoking <- cbind(pred_df_smoking, predict(fev1_mod, pred_df_smoking)) %>% 
+  unite("FEV1", link:SE)
+
+# FVC
+fvc_mod <- svyglm(formula = paste0("FVC_01 ~ WoodExp + ", 
+                             paste(fvc_covars, collapse = " + "),
+                             " + WoodExp*LH_smoke_status"),
+            design = pheno_analysis_surv)
+
+pred_df_smoking <-  cbind(pred_df_smoking, predict(fvc_mod, pred_df_smoking)) %>% 
+  unite("FVC", link:SE)
+
+# Ratio
+ratio_mod <- svyglm(formula = paste0("RATIO1_01_r ~ WoodExp + ", 
+                                     paste(covars, collapse = " + "),
+                                     " + WoodExp*LH_smoke_status"),
+                    design = pheno_analysis_surv)
+
+pred_df_smoking <-  cbind(pred_df_smoking, predict(ratio_mod, pred_df_smoking)) %>% 
+  unite("Ratio", link:SE)
+
+```
+
+Plot: 
+```{r}
+pred_df_smoking %>%
+  select(WoodExp, LH_smoke_status, FEV1, FVC, Ratio) %>%
+  pivot_longer(cols = FEV1:Ratio, names_to = "PFT") %>%
+  mutate(PFT = factor(PFT, levels = c("FEV1", "FVC", "Ratio"),
+                      labels = c("FEV[1]~(ml)", "FVC~(ml)", "FEV[1]/FVC~('%')"))) %>%
+  separate(value, into = c("Pred", "SE"), sep = "_") %>%
+  mutate(Pred = as.numeric(Pred), SE = as.numeric(SE)) %>%
+  mutate(LowCI = Pred - (1.96*SE), HighCI = Pred + (1.96*SE)) %>%
+  select(-SE) %>%
+  ggplot(aes(x = WoodExp, y = Pred, ymin = LowCI, ymax = HighCI, 
+             color = LH_smoke_status, shape = LH_smoke_status)) + 
+  geom_point(position = position_dodge(width = 1)) +
+  geom_errorbar(position = position_dodge(width = 1)) + 
+  facet_wrap(~PFT, nrow = 2, scales = "free_y", labeller = label_parsed) + 
+  labs(x = "Wood burning exposure", y = "Model estimated value", 
+       color = "Smoking status", shape = "Smoking status") + 
+  scale_x_discrete(labels = c("Unexposed", "Some", "Frequent")) + 
+  scale_color_manual(values = 
+                       RColorBrewer::brewer.pal(n = 5, name = "Greys")[c(3:5)],
+                     labels = c("Never", "Former", "Current")) +
+  scale_shape_manual(values = c(16, 17, 15), labels = c("Never", "Former", "Current")) +
+  theme_bw() + theme(legend.position = c(0.7,0.2))
+
+#ggsave(filename = "../Manuscript/FigS2_Woodburning_Smoking_Interaction_Plot.jpg",
+#       plot = last_plot(), device = "jpg", width = 6.5, height = 6.5, dpi = 300)
+```
+
+# Table S6: Unweighted multiariable associations by smoking status
+```{r}
+# Association results 
+# FEV1
+fev1_mod <- lm(formula = paste0("FEV1_01 ~ ", 
+                                paste(covars[-which(covars == "LH_smoke_status")], 
+                                      collapse = " + "), "+ WoodExpSmokingInt"), 
+               data = pheno_analysis)
+
+fev1_results <- 
+  rbind(summary(fev1_mod)$coef %>%
+          as.data.frame() %>%
+          rownames_to_column("Covariate") %>%
+          filter(grepl("Never", Covariate)) %>% 
+          mutate(Covariate = str_replace(Covariate, "WoodExpSmokingInt", "")) %>%
+          rename(SE = `Std. Error`, T = `t value`, P = `Pr(>|t|)`),
+        as_tibble(svycontrast(fev1_mod, contrasts = contrast_list), 
+                  rownames = NA) %>%
+          rownames_to_column("Covariate") %>%
+          rename(Estimate = contrast) %>%
+          mutate(T = Estimate/SE,
+                 P = 2 * pt(abs(T), df = df.residual(fev1_mod), 
+                            lower.tail = FALSE))) %>%
+  mutate(PFT = "FEV1")
+
+# FVC
+fvc_mod <- lm(formula = paste0("FVC_01 ~ ", 
+                               paste(fvc_covars[-which(fvc_covars == "LH_smoke_status")], 
+                                     collapse = " + "), "+ WoodExpSmokingInt"), 
+              data = pheno_analysis)
+
+fvc_results <- 
+  rbind(summary(fvc_mod)$coef %>%
+          as.data.frame() %>%
+          rownames_to_column("Covariate") %>%
+          filter(grepl("Never", Covariate)) %>% 
+          mutate(Covariate = str_replace(Covariate, "WoodExpSmokingInt", "")) %>%
+          rename(SE = `Std. Error`, T = `t value`, P = `Pr(>|t|)`),
+        as_tibble(svycontrast(fvc_mod, contrasts = contrast_list),
+                  rownames = NA) %>%
+          rownames_to_column("Covariate") %>%
+          rename(Estimate = contrast) %>%
+          mutate(T = Estimate/SE,
+                 P = 2 * pt(abs(T), df = df.residual(fvc_mod), 
+                            lower.tail = FALSE))) %>%
+  mutate(PFT = "FVC")
+
+# Ratio
+ratio_mod <- lm(formula = paste0("RATIO1_01_r ~ ", 
+                                 paste(covars[-which(covars == "LH_smoke_status")], 
+                                       collapse = " + "), "+ WoodExpSmokingInt"), 
+                data = pheno_analysis)
+
+ratio_results <- 
+  rbind(summary(ratio_mod)$coef %>%
+          as.data.frame() %>%
+          rownames_to_column("Covariate") %>%
+          filter(grepl("Never", Covariate)) %>% 
+          mutate(Covariate = str_replace(Covariate, "WoodExpSmokingInt", "")) %>%
+          rename(SE = `Std. Error`, T = `t value`, P = `Pr(>|t|)`),
+        as_tibble(svycontrast(ratio_mod, contrasts = contrast_list),
+                  rownames = NA) %>%
+          rownames_to_column("Covariate") %>%
+          rename(Estimate = contrast) %>%
+          mutate(T = Estimate/SE,
+                 P = 2 * pt(abs(T), df = df.residual(ratio_mod), 
+                            lower.tail = FALSE))) %>%
+  mutate(PFT = "Ratio")
+
+# Make table
+multivar_results <- rbind(fev1_results, fvc_results, ratio_results)
+
+multivar_results %>%
+  separate(col = Covariate, into = c("WoodExp", "Smoking"), sep = "-") %>%
+  mutate(LowCI = Estimate - (1.96 * SE),
+         HighCI = Estimate + (1.96 * SE),
+         Estimate = case_when(PFT %in% c("FEV1", "FVC") ~ round(Estimate, digits = 0),
+                              PFT == "Ratio" ~ signif(Estimate, digits = 1)),
+         LowCI = case_when(PFT %in% c("FEV1", "FVC") ~ round(LowCI, digits = 0),
+                           PFT == "Ratio" ~ signif(LowCI, digits = 1)),
+         HighCI = case_when(PFT %in% c("FEV1", "FVC") ~ round(HighCI, digits = 0),
+                            PFT == "Ratio" ~ signif(HighCI, digits = 1))) %>%
+  dplyr::select(PFT, WoodExp, Smoking, Estimate, LowCI, HighCI) %>%
+  mutate(LowCI = paste0("(", LowCI),
+         HighCI = paste0(HighCI, ")")) %>%
+  unite(col = CI, c(LowCI, HighCI), sep = ", ", remove = TRUE) %>%
+  unite(col = Estimate, c(Estimate, CI), sep = "\n", remove = TRUE) %>%
+  pivot_wider(names_from = PFT, values_from = Estimate) %>%
+  dplyr::select(WoodExp, Smoking, starts_with("FEV1"), starts_with("FVC"), 
+                starts_with("Ratio")) %>%
+  flextable() %>%
+  theme_box() %>% 
+  autofit() %>%
+  align(align = "center", part = "all") #%>% print(preview = "docx")
+
+```
+
+Sample sizes by wood burning x smoking group
+```{r}
+fev1_mod$model %>% group_by(WoodExpSmokingInt) %>% summarize(N = n())
+```
+
+# Table 3: Sample weighted multivariable results by asthma status
+```{r}
+# Association statistics
+contrast_list <- list("Some-Case" = c("WoodExpAsthmaIntUnexp-Case"=-1,
+                                      "WoodExpAsthmaIntSome-Case"=1),
+                      "Freq-Case" = c("WoodExpAsthmaIntUnexp-Case"=-1,
+                                      "WoodExpAsthmaIntFreq-Case"=1))
+
+# FEV1 
+fev1_mod <- svyglm(formula = paste0("FEV1_01 ~ ", 
+                                    paste(covars, collapse = " + "), 
+                                    "+ WoodExpAsthmaInt"), 
+                   design = pheno_analysis_surv)
+
+fev1_results <- 
+  rbind(summary(fev1_mod)$coef %>%
+          as.data.frame() %>%
+          rownames_to_column("Covariate") %>%
+          filter(grepl("Noncase", Covariate)) %>% 
+          mutate(Covariate = str_replace(Covariate, "WoodExpAsthmaInt", "")) %>%
+          rename(SE = `Std. Error`, T = `t value`, P = `Pr(>|t|)`),
+        as_tibble(svycontrast(fev1_mod, contrasts = contrast_list), 
+                  rownames = NA) %>%
+          rownames_to_column("Covariate") %>%
+          rename(Estimate = contrast) %>%
+          mutate(T = Estimate/SE,
+                 P = 2 * pt(abs(T), df = df.residual(fev1_mod), 
+                            lower.tail = FALSE))) %>%
+  mutate(PFT = "FEV1")
+
+# FVC 
+fvc_mod <- svyglm(formula = paste0("FVC_01 ~ ", 
+                                   paste(fvc_covars, collapse = " + "), 
+                                   "+ WoodExpAsthmaInt"), 
+                   design = pheno_analysis_surv)
+
+fvc_results <- 
+  rbind(summary(fvc_mod)$coef %>%
+          as.data.frame() %>%
+          rownames_to_column("Covariate") %>%
+          filter(grepl("Noncase", Covariate)) %>% 
+          mutate(Covariate = str_replace(Covariate, "WoodExpAsthmaInt", "")) %>%
+          rename(SE = `Std. Error`, T = `t value`, P = `Pr(>|t|)`),
+        as_tibble(svycontrast(fvc_mod, contrasts = contrast_list),
+                  rownames = NA) %>%
+          rownames_to_column("Covariate") %>%
+          rename(Estimate = contrast) %>%
+          mutate(T = Estimate/SE,
+                 P = 2 * pt(abs(T), df = df.residual(fvc_mod), 
+                            lower.tail = FALSE))) %>%
+  mutate(PFT = "FVC")
+
+# Ratio 
+ratio_mod <- svyglm(formula = paste0("RATIO1_01_r ~ ", 
+                                     paste(covars, collapse = " + "), 
+                                     "+ WoodExpAsthmaInt"), 
+                   design = pheno_analysis_surv)
+
+ratio_results <- 
+  rbind(summary(ratio_mod)$coef %>%
+          as.data.frame() %>%
+          rownames_to_column("Covariate") %>%
+          filter(grepl("Noncase", Covariate)) %>% 
+          mutate(Covariate = str_replace(Covariate, "WoodExpAsthmaInt", "")) %>%
+          rename(SE = `Std. Error`, T = `t value`, P = `Pr(>|t|)`),
+        as_tibble(svycontrast(ratio_mod, contrasts = contrast_list),
+                  rownames = NA) %>%
+          rownames_to_column("Covariate") %>%
+          rename(Estimate = contrast) %>%
+          mutate(T = Estimate/SE,
+                 P = 2 * pt(abs(T), df = df.residual(ratio_mod), 
+                            lower.tail = FALSE))) %>%
+  mutate(PFT = "Ratio")
+
+# Write table 
+multivar_results <- rbind(fev1_results, fvc_results, ratio_results)
+
+multivar_results %>%
+  separate(col = Covariate, into = c("WoodExp", "Asthma"), sep = "-") %>%
+  mutate(LowCI = Estimate - (1.96 * SE),
+         HighCI = Estimate + (1.96 * SE),
+         Estimate = case_when(PFT %in% c("FEV1", "FVC") ~ 
+                                   round(Estimate, digits = 0),
+                                 PFT == "Ratio" ~ signif(Estimate, digits = 1)),
+         LowCI = case_when(PFT %in% c("FEV1", "FVC") ~ 
+                                round(LowCI, digits = 0),
+                              PFT == "Ratio" ~ signif(LowCI, digits = 1)),
+         HighCI = case_when(PFT %in% c("FEV1", "FVC") ~ 
+                                 round(HighCI, digits = 0),
+                               PFT == "Ratio" ~ signif(HighCI, digits = 1))) %>%
+  dplyr::select(PFT, WoodExp, Asthma, Estimate, LowCI, HighCI) %>%
+  mutate(LowCI = paste0("(", LowCI),
+         HighCI = paste0(HighCI, ")")) %>%
+  unite(col = CI, c(LowCI, HighCI), sep = ", ", remove = TRUE) %>%
+  unite(col = Estimate, c(Estimate, CI), sep = "\n", remove = TRUE) %>%
+  arrange(match(PFT, c("FEV1", "FVC", "Ratio"))) %>%
+  pivot_wider(names_from = PFT, values_from = Estimate) %>%
+  dplyr::select(WoodExp, Asthma, starts_with("FEV1"), starts_with("FVC"), 
+                starts_with("Ratio")) %>%
+  flextable() %>%
+  theme_box() %>% 
+  autofit() %>%
+  align(align = "center", part = "all") #%>% print(preview = "docx")
+
+
+```
+
+Sample sizes
+```{r}
+fev1_mod$model %>% group_by(WoodExpAsthmaInt) %>% summarize(N = n())
+```
+
+Interaction product term p-values
+```{r}
+# FEV1
+fev1_mod <- svyglm(formula = paste0("FEV1_01 ~ ", 
+                             paste(covars, collapse = " + "),
+                             " + WoodExp*LHSScreen_12142015"),
+            design = pheno_analysis_surv)
+
+signif(summary(fev1_mod)$coef[last(rownames(summary(fev1_mod)$coef)),4], digits = 2)
+
+# FVC
+fvc_mod <- svyglm(formula = paste0("FVC_01 ~ ", 
+                                   paste(fvc_covars, collapse = " + "),
+                                   " + WoodExp*LHSScreen_12142015"),
+            design = pheno_analysis_surv)
+
+signif(summary(fvc_mod)$coef[last(rownames(summary(fvc_mod)$coef)),4], digits = 2)
+
+ratio_mod <- svyglm(formula = paste0("RATIO1_01_r ~ ", 
+                                     paste(covars, collapse = " + "),
+                                     " + WoodExp*LHSScreen_12142015"),
+                    design = pheno_analysis_surv)
+
+signif(summary(ratio_mod)$coef[last(rownames(summary(ratio_mod)$coef)),4], digits = 2)
+
+```
+
+# Figure 1: Predicted values by wood buring exposure and asthma status
+```{r}
+pred_df_asthma <- tibble(
+  pft_age = svymean(~pft_age, design = pheno_analysis_surv)[1],
+  pft_age_sq = svymean(~pft_age, design = pheno_analysis_surv)[1]^2,
+  gender = factor(0),
+  race_B = factor(0),
+  LH_Height = svymean(~LH_Height, design = pheno_analysis_surv)[1],
+  Height_2 = svymean(~LH_Height, design = pheno_analysis_surv)[1]^2,
+  LH_Weight = svymean(~LH_Weight, design = pheno_analysis_surv)[1],
+  state = factor(0),
+  LH_packyears = svymean(~LH_packyears, design = pheno_analysis_surv)[1],
+  LH_smoke_status = factor(1),
+  LHSScreen_12142015 = factor(c(0,0,0,1,1,1)),
+  WoodExp = factor(c(0,1,2,0,1,2))
+)
+
+pred_df_asthma <- cbind(pred_df_asthma, predict(fev1_mod, pred_df_asthma)) %>% unite("FEV1", link:SE)
+pred_df_asthma <-  cbind(pred_df_asthma, predict(fvc_mod, pred_df_asthma)) %>% unite("FVC", link:SE)
+pred_df_asthma <- cbind(pred_df_asthma, predict(ratio_mod, pred_df_asthma)) %>% unite("Ratio", link:SE)
+```
+
+Plot
+```{r}
+pred_df_asthma %>%
+  select(WoodExp, LHSScreen_12142015, FEV1, FVC, Ratio) %>%
+  pivot_longer(cols = FEV1:Ratio, names_to = "PFT") %>%
+  mutate(PFT = factor(PFT, levels = c("FEV1", "FVC", "Ratio"),
+                      labels = c("FEV[1]~(ml)", "FVC~(ml)", "FEV[1]/FVC~('%')"))) %>%
+  separate(value, into = c("Pred", "SE"), sep = "_") %>%
+  mutate(Pred = as.numeric(Pred), SE = as.numeric(SE)) %>%
+  mutate(LowCI = Pred - (1.96*SE), HighCI = Pred + (1.96*SE)) %>%
+  select(-SE) %>%
+  ggplot(aes(x = WoodExp, y = Pred, ymin = LowCI, ymax = HighCI, 
+             color = LHSScreen_12142015, shape = LHSScreen_12142015)) + 
+  geom_point(position = position_dodge(width = 1)) +
+  geom_errorbar(position = position_dodge(width = 1)) + 
+  facet_wrap(~PFT, nrow = 2, scales = "free_y", labeller = label_parsed) + 
+  labs(x = "Wood burning exposure", y = "Model estimated value", 
+       color = "Asthma status", shape = "Asthma status") + 
+  scale_x_discrete(labels = c("Unexposed", "Some", "Frequent")) + 
+  scale_color_manual(values = RColorBrewer::brewer.pal(n = 6, name = "Greys")[c(4,6)],
+                     labels = c("Non-case", "Case")) +
+  scale_shape_manual(values = c(16, 17), labels = c("Non-case", "Case")) +
+  theme_bw() + theme(legend.position = c(0.7, 0.2))
+
+#ggsave(filename = "../Manuscript/Fig1_Woodburning_Asthma_Interaction_Plot.jpg",
+#       plot = last_plot(), device = "jpg", width = 6.5, height = 6.5, dpi = 300)
+```
+
+# Table S7: Unweighted associations by asthma status
+```{r}
+# Association stats
+fev1_mod <- lm(formula = paste0("FEV1_01 ~ ", paste(covars, collapse = " + "), 
+                                "+ WoodExpAsthmaInt"), 
+               data = pheno_analysis)
+
+fev1_results <- 
+  rbind(summary(fev1_mod)$coef %>%
+          as.data.frame() %>%
+          rownames_to_column("Covariate") %>%
+          filter(grepl("Noncase", Covariate)) %>% 
+          mutate(Covariate = str_replace(Covariate, "WoodExpAsthmaInt", "")) %>%
+          rename(SE = `Std. Error`, T = `t value`, P = `Pr(>|t|)`),
+        as_tibble(svycontrast(fev1_mod, contrasts = contrast_list), 
+                  rownames = NA) %>%
+          rownames_to_column("Covariate") %>%
+          rename(Estimate = contrast) %>%
+          mutate(T = Estimate/SE,
+                 P = 2 * pt(abs(T), df = df.residual(fev1_mod), 
+                            lower.tail = FALSE))) %>%
+  mutate(PFT = "FEV1")
+
+fvc_mod <- lm(formula = paste0("FVC_01 ~ ", paste(fvc_covars, collapse = " + "), 
+                               "+ WoodExpAsthmaInt"), 
+              data = pheno_analysis)
+
+fvc_results <- 
+  rbind(summary(fvc_mod)$coef %>%
+          as.data.frame() %>%
+          rownames_to_column("Covariate") %>%
+          filter(grepl("Noncase", Covariate)) %>% 
+          mutate(Covariate = str_replace(Covariate, "WoodExpAsthmaInt", "")) %>%
+          rename(SE = `Std. Error`, T = `t value`, P = `Pr(>|t|)`),
+        as_tibble(svycontrast(fvc_mod, contrasts = contrast_list),
+                  rownames = NA) %>%
+          rownames_to_column("Covariate") %>%
+          rename(Estimate = contrast) %>%
+          mutate(T = Estimate/SE,
+                 P = 2 * pt(abs(T), df = df.residual(fvc_mod), 
+                            lower.tail = FALSE))) %>%
+  mutate(PFT = "FVC")
+
+ratio_mod <- lm(formula = paste0("RATIO1_01_r ~ ", paste(covars, collapse = " + "), 
+                                 "+ WoodExpAsthmaInt"), 
+                data = pheno_analysis)
+
+ratio_results <- 
+  rbind(summary(ratio_mod)$coef %>%
+          as.data.frame() %>%
+          rownames_to_column("Covariate") %>%
+          filter(grepl("Noncase", Covariate)) %>% 
+          mutate(Covariate = str_replace(Covariate, "WoodExpAsthmaInt", "")) %>%
+          rename(SE = `Std. Error`, T = `t value`, P = `Pr(>|t|)`),
+        as_tibble(svycontrast(ratio_mod, contrasts = contrast_list),
+                  rownames = NA) %>%
+          rownames_to_column("Covariate") %>%
+          rename(Estimate = contrast) %>%
+          mutate(T = Estimate/SE,
+                 P = 2 * pt(abs(T), df = df.residual(ratio_mod), 
+                            lower.tail = FALSE))) %>%
+  mutate(PFT = "Ratio")
+
+# Write table
+multivar_results <- rbind(fev1_results, fvc_results, ratio_results)
+
+multivar_results %>%
+  separate(col = Covariate, into = c("WoodExp", "Asthma"), sep = "-") %>%
+  mutate(LowCI = Estimate - (1.96 * SE),
+         HighCI = Estimate + (1.96 * SE),
+         Estimate = case_when(PFT %in% c("FEV1", "FVC") ~ 
+                                   round(Estimate, digits = 0),
+                                 PFT == "Ratio" ~ signif(Estimate, digits = 1)),
+         LowCI = case_when(PFT %in% c("FEV1", "FVC") ~ 
+                                round(LowCI, digits = 0),
+                              PFT == "Ratio" ~ signif(LowCI, digits = 1)),
+         HighCI = case_when(PFT %in% c("FEV1", "FVC") ~ 
+                                 round(HighCI, digits = 0),
+                               PFT == "Ratio" ~ signif(HighCI, digits = 1))) %>%
+  dplyr::select(PFT, WoodExp, Asthma, Estimate, LowCI, HighCI) %>%
+  mutate(LowCI = paste0("(", LowCI),
+         HighCI = paste0(HighCI, ")")) %>%
+  unite(col = CI, c(LowCI, HighCI), sep = ", ", remove = TRUE) %>%
+  unite(col = Estimate, c(Estimate, CI), sep = "\n", remove = TRUE) %>%
+  arrange(match(PFT, c("FEV1", "FVC", "Ratio"))) %>%
+  pivot_wider(names_from = PFT, values_from = Estimate) %>%
+  dplyr::select(WoodExp, Asthma, starts_with("FEV1"), starts_with("FVC"), 
+                starts_with("Ratio")) %>%
+  flextable() %>%
+  theme_box() %>% 
+  autofit() %>%
+  align(align = "center", part = "all") #%>% print(preview = "docx")
+```
+
+Sample sizes
+```{r}
+fev1_mod$model %>% group_by(WoodExpAsthmaInt) %>% summarize(N = n())
+```
+
+Interaction product terms
+```{r}
+fev1_mod <- lm(formula = paste0("FEV1_01 ~ ", paste(covars, collapse = " + "),
+                         " + WoodExp*LHSScreen_12142015"),
+        data = pheno_analysis)
+
+signif(summary(fev1_mod)$coef[last(rownames(summary(fev1_mod)$coef)),4], digits = 2)
+
+
+fvc_mod <- lm(formula = paste0("FVC_01 ~ ", paste(fvc_covars, collapse = " + "),
+                             " + WoodExp*LHSScreen_12142015"),
+            data = pheno_analysis)
+
+signif(summary(fvc_mod)$coef[last(rownames(summary(fvc_mod)$coef)),4], digits = 2)
+
+ratio_mod <- lm(formula = paste0("RATIO1_01_r ~ ", paste(covars, collapse = " + "),
+                         " + WoodExp*LHSScreen_12142015"),
+            data = pheno_analysis)
+
+signif(summary(ratio_mod)$coef[last(rownames(summary(ratio_mod)$coef)),4], digits = 2)
+```
+
+# Table S8: Values used when plotting Figure 1 and Figure S2
+```{r}
+rbind(pred_df_smoking %>% mutate(LHSScreen_12142015 = "", Model = "Smoking interaction") %>% 
+        select(Model, LHSScreen_12142015, LH_smoke_status, WoodExp, FEV1, FVC, Ratio),
+      pred_df_asthma %>% mutate(Model = "Asthma interaction") %>% 
+        select(Model, LHSScreen_12142015, LH_smoke_status, WoodExp, FEV1, FVC, Ratio)) %>% 
+  pivot_longer(cols = FEV1:Ratio, names_to = "PFT") %>%
+  separate(value, into = c("Pred", "SE"), sep = "_") %>%
+  mutate(Pred = as.numeric(Pred),
+         SE = as.numeric(SE),
+         LowCI = Pred - (1.96 * SE),
+         HighCI = Pred + (1.96 * SE),
+         Pred = case_when(PFT %in% c("FEV1", "FVC") ~ round(Pred, digits = 0),
+                          PFT == "Ratio" ~ round(Pred, digits = 1)),
+         LowCI = case_when(PFT %in% c("FEV1", "FVC") ~ round(LowCI, digits = 0),
+                           PFT == "Ratio" ~ round(LowCI, digits = 1)),
+         HighCI = case_when(PFT %in% c("FEV1", "FVC") ~ round(HighCI, digits = 0),
+                            PFT == "Ratio" ~ round(HighCI, digits = 1))) %>%
+  dplyr::select(Model, LHSScreen_12142015, LH_smoke_status, WoodExp, PFT, Pred, LowCI, HighCI) %>%
+  mutate(LowCI = paste0("(", LowCI),
+         HighCI = paste0(HighCI, ")")) %>%
+  unite(col = CI, c(LowCI, HighCI), sep = ", ", remove = TRUE) %>%
+  unite(col = Pred, c(Pred, CI), sep = "\n", remove = TRUE) %>%
+  arrange(match(PFT, c("FEV1", "FVC", "Ratio"))) %>%
+  pivot_wider(names_from = PFT, values_from = Pred) %>%
+  arrange(Model) %>%
+  flextable() %>%
+  theme_box() %>% 
+  autofit() %>%
+  align(align = "center", part = "all") #%>% print(preview = "docx")
+
+
+```
+
+# Table 4: Sample weighted multivariable results for FeNO 
+Mean and SD overall and per group
+```{r}
+# Overall mean
+signif(svymean(~FTSC_eNO_Average_Win_log, 
+        design = pheno_analysis_feno_surv), digits = 2)
+
+# Overall SD
+jtools::svysd(~FTSC_eNO_Average_Win_log, 
+        design = pheno_analysis_feno_surv, digits = 2)
+
+# Mean and SD by smoking status
+gtsummary::tbl_svysummary(pheno_analysis_feno_surv, by = LH_smoke_status, 
+                          statistic = list(all_continuous() ~ "{mean} ({sd})"), 
+                          include = c("FTSC_eNO_Average_Win_log", "LH_smoke_status"))
+
+# Mean by asthma status 
+svyby(~FTSC_eNO_Average_Win_log, ~LHSScreen_12142015,
+      design = pheno_analysis_feno_surv, svymean) %>%
+  mutate(FTSC_eNO_Average_Win_log = signif(FTSC_eNO_Average_Win_log, digits = 3))
+
+# SD for non-asthmatics 
+jtools::svysd(~FTSC_eNO_Average_Win_log, 
+              design = subset(pheno_analysis_feno_surv, LHSScreen_12142015 == 0),
+              digits = 2)
+
+# SD for asthmatics
+jtools::svysd(~FTSC_eNO_Average_Win_log, 
+              design = subset(pheno_analysis_feno_surv, LHSScreen_12142015 == 1),
+              digits = 2)
+```
+
+Associations among all participants
+```{r}
+feno_covars <- c("pft_age", "gender", "race_B", "LH_Height", "LH_Weight", "state", 
+                 "LH_smoke_status", "LH_packyears", "Im_Atopic_Spec_v2")
+
+feno_mod <- svyglm(formula = 
+                     paste0("FTSC_eNO_Average_Win_log ~ WoodExp + ", 
+                            paste(feno_covars, collapse = " + ")),
+                   design = pheno_analysis_feno_surv)
+
+feno_results <- summary(feno_mod)$coef %>% 
+  as.data.frame() %>%
+  rownames_to_column("Covariate") %>%
+  filter(grepl("WoodExp", Covariate)) %>% 
+  mutate(Covariate = str_replace_all(Covariate, c("WoodExp1" = "Some-All",
+                                              "WoodExp2" = "Freq-All"))) %>%
+  mutate(Group = "All") %>%
+  rename(SE = `Std. Error`, T = `t value`, P = `Pr(>|t|)`)
+```
+
+Smoking interaction model
+```{r}
+contrast_list <- list("Some-Former" = c("WoodExpSmokingIntUnexp-Former"=-1,
+                                        "WoodExpSmokingIntSome-Former"=1),
+                      "Freq-Former" = c("WoodExpSmokingIntUnexp-Former"=-1,
+                                        "WoodExpSmokingIntFreq-Former"=1),
+                      "Some-Current" = c("WoodExpSmokingIntUnexp-Current"=-1,
+                                         "WoodExpSmokingIntSome-Current"=1),
+                      "Freq-Current" = c("WoodExpSmokingIntUnexp-Current"=-1,
+                                         "WoodExpSmokingIntFreq-Current"=1))
+
+feno_smoking_mod <- svyglm(formula = paste0("FTSC_eNO_Average_Win_log ~ ", 
+                                    paste(feno_covars[-which(feno_covars == "LH_smoke_status")], 
+                                          collapse = " + "), "+ WoodExpSmokingInt"), 
+                   design = pheno_analysis_feno_surv)
+
+feno_smoking_results <- 
+  rbind(summary(feno_smoking_mod)$coef %>%
+          as.data.frame() %>%
+          rownames_to_column("Covariate") %>%
+          filter(grepl("Never", Covariate)) %>% 
+          mutate(Covariate = str_replace(Covariate, "WoodExpSmokingInt", "")) %>%
+          rename(SE = `Std. Error`, T = `t value`, P = `Pr(>|t|)`),
+        as_tibble(svycontrast(feno_smoking_mod, contrasts = contrast_list), 
+                  rownames = NA) %>%
+          rownames_to_column("Covariate") %>%
+          rename(Estimate = contrast) %>%
+          mutate(T = Estimate/SE,
+                 P = 2 * pt(abs(T), df = df.residual(feno_smoking_mod), 
+                            lower.tail = FALSE))) %>%
+  mutate(Group = "BySmoking")
+```
+
+Asthma interaction model
+```{r}
+contrast_list <- list("Some-Case" = c("WoodExpAsthmaIntUnexp-Case"=-1,
+                                        "WoodExpAsthmaIntSome-Case"=1),
+                      "Freq-Case" = c("WoodExpAsthmaIntUnexp-Case"=-1,
+                                        "WoodExpAsthmaIntFreq-Case"=1))
+
+feno_asthma_mod <- svyglm(formula = paste0("FTSC_eNO_Average_Win_log ~ ", 
+                                    paste(feno_covars, collapse = " + "), 
+                                    "+ WoodExpAsthmaInt"), 
+                   design = pheno_analysis_feno_surv)
+
+feno_asthma_results <- 
+  rbind(summary(feno_asthma_mod)$coef %>%
+          as.data.frame() %>%
+          rownames_to_column("Covariate") %>%
+          filter(grepl("Noncase", Covariate)) %>% 
+          mutate(Covariate = str_replace(Covariate, "WoodExpAsthmaInt", "")) %>%
+          rename(SE = `Std. Error`, T = `t value`, P = `Pr(>|t|)`),
+        as_tibble(svycontrast(feno_asthma_mod, contrasts = contrast_list), 
+                  rownames = NA) %>%
+          rownames_to_column("Covariate") %>%
+          rename(Estimate = contrast) %>%
+          mutate(T = Estimate/SE,
+                 P = 2 * pt(abs(T), df = df.residual(feno_asthma_mod), 
+                            lower.tail = FALSE))) %>%
+  mutate(Group = "ByAsthma")
+```
+
+Write association results for table
+```{r}
+rbind(feno_results, feno_smoking_results, feno_asthma_results) %>%
+  mutate(Estimate = signif(Estimate, digits = 1)) %>%
+  mutate(LowCI = signif(Estimate - (1.96*SE), digits = 1),
+         HighCI = signif(Estimate + (1.96*SE), digits = 1)) %>%
+  mutate(LowCI = paste0("(", LowCI),
+         HighCI = paste0(HighCI, ")")) %>%
+  unite(col = CI, c(LowCI, HighCI), sep = ", ", remove = TRUE) %>%
+  unite(col = "Estimate", c(Estimate, CI), sep = "\n", remove = TRUE) %>%
+  select(-c(SE, `T`, P, Group)) %>%
+  separate(col = Covariate, into = c("WoodExp", "Group"), sep = "-") %>%
+  pivot_wider(names_from = WoodExp, values_from = Estimate) %>%
+  flextable() %>%
+  theme_box() %>% 
+  autofit() %>%
+  align(align = "center", part = "all") #%>% print(preview = "docx")
+```
+
+Sample sizes
+```{r}
+# By wood burning exposure
+feno_mod$model %>% group_by(WoodExp) %>% summarize(N = n())
+
+# By wood burning and smoking status
+feno_smoking_mod$model %>% group_by(WoodExpSmokingInt) %>% summarize(N = n())
+
+# By wood burning and asthma status
+feno_asthma_mod$model %>% group_by(WoodExpAsthmaInt) %>% summarize(N = n())
+```
+
+Interaction product terms
+```{r}
+# Smoking interaction
+feno_smoking_mod <- svyglm(formula = paste0("FTSC_eNO_Average_Win_log ~ ", 
+                                            paste(feno_covars[-which(feno_covars == "LH_smoke_status")], 
+                                                  collapse = " + "),
+                                            " + WoodExp*LH_smoke_status"),
+                           design = pheno_analysis_feno_surv)
+
+signif(summary(feno_smoking_mod)$coef[c("WoodExp2:LH_smoke_status2", "WoodExp2:LH_smoke_status3"),4], 
+       digits = 2)
+
+# Asthma interaction
+feno_asthma_mod <- svyglm(formula = paste0("FTSC_eNO_Average_Win_log ~  ", 
+                                           paste(feno_covars, collapse = " + "),
+                                           " + WoodExp*LHSScreen_12142015"),
+                          design = pheno_analysis_feno_surv)
+
+signif(summary(feno_asthma_mod)$coef["WoodExp2:LHSScreen_121420151", 4], digits = 2)
+```
+
+# Table S9: Unweighted associations with FeNO
+Average and SD
+```{r}
+# All participants
+tbl_summary(pheno_analysis_feno, include = FTSC_eNO_Average_Win_log, 
+            statistic = list(all_continuous() ~ "{mean} ({sd})"))
+
+# By smoking status
+tbl_summary(pheno_analysis_feno, by = LH_smoke_status,
+            include = c(FTSC_eNO_Average_Win_log, LH_smoke_status),
+            statistic = list(all_continuous() ~ "{mean} ({sd})"))
+
+# By asthma status
+tbl_summary(pheno_analysis_feno, by = LHSScreen_12142015,
+            include = c(FTSC_eNO_Average_Win_log, LHSScreen_12142015),
+            statistic = list(all_continuous() ~ "{mean} ({sd})"))
+```
+
+```{r}
+# All participants
+feno_mod <- lm(formula = 
+                 paste0("FTSC_eNO_Average_Win_log ~ WoodExp + ", 
+                        paste(feno_covars, collapse = " + ")),
+               data = pheno_analysis_feno)
+
+feno_results <- summary(feno_mod)$coef %>% 
+  as.data.frame() %>%
+  rownames_to_column("Covariate") %>%
+  filter(grepl("WoodExp", Covariate)) %>% 
+  mutate(Covariate = str_replace_all(Covariate, c("WoodExp1" = "Some-All",
+                                              "WoodExp2" = "Freq-All"))) %>%
+  mutate(Group = "All") %>%
+  rename(SE = `Std. Error`, T = `t value`, P = `Pr(>|t|)`)
+
+# By smoking status
+contrast_list <- list("Some-Former" = c("WoodExpSmokingIntUnexp-Former"=-1,
+                                        "WoodExpSmokingIntSome-Former"=1),
+                      "Freq-Former" = c("WoodExpSmokingIntUnexp-Former"=-1,
+                                        "WoodExpSmokingIntFreq-Former"=1),
+                      "Some-Current" = c("WoodExpSmokingIntUnexp-Current"=-1,
+                                         "WoodExpSmokingIntSome-Current"=1),
+                      "Freq-Current" = c("WoodExpSmokingIntUnexp-Current"=-1,
+                                         "WoodExpSmokingIntFreq-Current"=1))
+
+feno_smoking_mod <- lm(formula = 
+                         paste0("FTSC_eNO_Average_Win_log ~ ", 
+                                paste(
+                                  feno_covars[-which(feno_covars == "LH_smoke_status")], 
+                                  collapse = " + "), 
+                                "+ WoodExpSmokingInt"), 
+                       data = pheno_analysis_feno)
+
+feno_smoking_results <- 
+  rbind(summary(feno_smoking_mod)$coef %>%
+          as.data.frame() %>%
+          rownames_to_column("Covariate") %>%
+          filter(grepl("Never", Covariate)) %>% 
+          mutate(Covariate = str_replace(Covariate, "WoodExpSmokingInt", "")) %>%
+          rename(SE = `Std. Error`, T = `t value`, P = `Pr(>|t|)`),
+        as_tibble(svycontrast(feno_smoking_mod, contrasts = contrast_list), 
+                  rownames = NA) %>%
+          rownames_to_column("Covariate") %>%
+          rename(Estimate = contrast) %>%
+          mutate(T = Estimate/SE,
+                 P = 2 * pt(abs(T), df = df.residual(feno_smoking_mod), 
+                            lower.tail = FALSE))) %>%
+  mutate(Group = "BySmoking")
+
+# By asthma status
+contrast_list <- list("Some-Case" = c("WoodExpAsthmaIntUnexp-Case"=-1,
+                                        "WoodExpAsthmaIntSome-Case"=1),
+                      "Freq-Case" = c("WoodExpAsthmaIntUnexp-Case"=-1,
+                                        "WoodExpAsthmaIntFreq-Case"=1))
+
+feno_asthma_mod <- lm(formula = paste0("FTSC_eNO_Average_Win_log ~ ", 
+                                    paste(feno_covars, collapse = " + "), 
+                                    "+ WoodExpAsthmaInt"), 
+                   data = pheno_analysis_feno)
+
+feno_asthma_results <- 
+  rbind(summary(feno_asthma_mod)$coef %>%
+          as.data.frame() %>%
+          rownames_to_column("Covariate") %>%
+          filter(grepl("Noncase", Covariate)) %>% 
+          mutate(Covariate = str_replace(Covariate, "WoodExpAsthmaInt", "")) %>%
+          rename(SE = `Std. Error`, T = `t value`, P = `Pr(>|t|)`),
+        as_tibble(svycontrast(feno_asthma_mod, contrasts = contrast_list), 
+                  rownames = NA) %>%
+          rownames_to_column("Covariate") %>%
+          rename(Estimate = contrast) %>%
+          mutate(T = Estimate/SE,
+                 P = 2 * pt(abs(T), df = df.residual(feno_asthma_mod), 
+                            lower.tail = FALSE))) %>%
+  mutate(Group = "ByAsthma")
+
+# Write association statistics table
+rbind(feno_results, feno_smoking_results, feno_asthma_results) %>%
+  mutate(Estimate = signif(Estimate, digits = 1)) %>%
+  mutate(LowCI = signif(Estimate - (1.96*SE), digits = 1),
+         HighCI = signif(Estimate + (1.96*SE), digits = 1)) %>%
+  mutate(LowCI = paste0("(", LowCI),
+         HighCI = paste0(HighCI, ")")) %>%
+  unite(col = CI, c(LowCI, HighCI), sep = ", ", remove = TRUE) %>%
+  unite(col = "Estimate", c(Estimate, CI), sep = "\n", remove = TRUE) %>%
+  select(-c(SE, `T`, Group, P)) %>%
+  separate(col = Covariate, into = c("WoodExp", "Group"), sep = "-") %>%
+  pivot_wider(names_from = WoodExp, values_from = Estimate) %>%
+  flextable() %>%
+  theme_box() %>% 
+  autofit() %>%
+  align(align = "center", part = "all") #%>% print(preview = "docx")
+
+```
+
+Sample sizes
+```{r}
+# Overall
+feno_mod$model %>% group_by(WoodExp) %>% summarize(N = n())
+
+# By smoking
+feno_smoking_mod$model %>% group_by(WoodExpSmokingInt) %>% summarize(N = n())
+
+# By asthma
+feno_asthma_mod$model %>% group_by(WoodExpAsthmaInt) %>% summarize(N = n())
+```
+
+Interaction product terms
+```{r}
+# Smoking
+feno_smoking_mod <- lm(formula = 
+                         paste0("FTSC_eNO_Average_Win_log ~ ", 
+                                paste(feno_covars[-which(feno_covars == "LH_smoke_status")],
+                                      collapse = " + "),
+                                " + WoodExp*LH_smoke_status"),
+                       data = pheno_analysis_feno)
+
+signif(summary(feno_smoking_mod)$coef[c("WoodExp2:LH_smoke_status2",
+                                        "WoodExp2:LH_smoke_status3"),4], 
+       digits = 2)
+
+# Asthma
+feno_asthma_mod <- lm(formula = paste0("FTSC_eNO_Average_Win_log ~ ", 
+                                       paste(feno_covars, collapse = " + "),
+                                       " + WoodExp*LHSScreen_12142015"),
+                      data = pheno_analysis_feno)
+
+signif(summary(feno_asthma_mod)$coef["WoodExp2:LHSScreen_121420151", 4], digits = 2)
+
+```
+
+
+
+# Session Info: 
+```{r}
+sessionInfo()
+```
+

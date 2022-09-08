@@ -1,10 +1,15 @@
 # Residential wood burning and pulmonary function in the Agricultural Lung Health Study
- This analysis was undertaken to assess if wood burning exposure was related to 
- pulmonary function, and a publication is in review now. The repository will be
- updated with a citation when available. In the meantime, the abstract is below, 
- and you can scroll through the executed code at https://juliedwhite.github.io/Woodsmoke_PFTs/
- 
- 
+This analysis was undertaken to assess if wood burning exposure was related to 
+pulmonary function; the paper has been published in *Environmental Health Perspectives*.
+You can scroll through the executed code at https://juliedwhite.github.io/Woodsmoke_PFTs/
+
+## Citation
+White, J.D., Wyss, A.B., Hoang, T.T., Lee, M.K., Richards, M., Parks, C.G., 
+Beane-Freeman, L.E., Hankinson, J.L., Umbach, D.M., London, S.J. (2022). 
+Residential wood burning and pulmonary function in the Agricultural Lung Health Study. 
+Environmental Health Perspectives. 130(8). https://doi.org/10.1289/EHP10734. 
+
+## Abstract
 *Background*  
 In low- and middle-income countries, burning biomass indoors for cooking or 
 heating has been associated with poorer lung function. In high-income countries, 
